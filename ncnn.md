@@ -543,9 +543,7 @@ def trans_csv_to_param():
 
 # 7 ncnn不支持层原理与实现
 
-## 基础张量运算
-
-### 7.1 transpose 原理
+## 7.1 transpose 原理
 
 考虑到可读性，实现转置需要单独对不同维度数的张量编写（否则要上递归）ncnn只提供了三维及以下张量的转置 permute层，要处理tensorflow的各种四维张量或者conv的四维filter，需要自定义层transpose来实现
 
@@ -630,7 +628,7 @@ for(int i=0;i<shape[t[0]];i++){
 
 
 
-### 7.2 extract_image_patches 原理
+## 7.2 extract_image_patches 原理
 
 从图像张量中，抽取patch，并将抽取到的patch和通道一并摊平
 
@@ -709,7 +707,7 @@ shape:(1, 2, 2, 48)
 
 
 
-### 7.3 Interp 中心对齐 修改ncnn
+## 7.3 Interp 中心对齐 修改ncnn
 
 中心对齐问题
 
@@ -781,7 +779,7 @@ tf.image.resize_nearest_neighbor包含中心对齐（或者称为align_corners�
 
 
 
-### 7.4 Normalize_sp 自定义ncnn层
+## 7.4 Normalize_sp 自定义ncnn层
 
 抽象tf.nn.l2_normalize(w,axis=[0,1,2]) 过程
 
@@ -857,7 +855,7 @@ int Normalize_sp::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
 
 
 
-### 7.5 Ert  自定义ncnn层
+## 7.5 Ert  自定义ncnn层
 
 extract_image_patches reshape transpose  
 
@@ -986,7 +984,7 @@ for(int i=0;i<r_shape[0];i++){
 
 
 
-### 7.6 Conv 自定义ncnn层
+## 7.6 Conv 自定义ncnn层
 
 **1.多输入**
 
@@ -1024,13 +1022,157 @@ wpt[0] = 1;wpt[1] = 0;wpt[2] = 0;wpt[3] = 0;wpt[4] = 1;wpt[5] = 0;wpt[6] = 0;wpt
 
 **3. 逆卷积** 转置卷积 反卷积
 
-tensorflow 的tf.nn.conv2d_transpose 功能全等于一个扩展边界后 上采样插值（插零）然后进行卷积
-
-在inpaint构建网络脚本中 deconv使用了func=tf.image.resize_nearest_neighbor来进行插值 和tf.nn.conv2d_transpose有所区别
+在inpaint构建网络脚本中 deconv直接使用了func=tf.image.resize_nearest_neighbor来进行插值 和tf.nn.conv2d_transpose有所区别
 
 
 
-### 7.7 Exc 自定义ncnn层
+tensorflow 的tf.nn.conv2d_transpose 功能是将小张量处理为大张量，举例如下：
+
+对于3×3×3的三通道张量input：
+
+```python
+[[1. 2. 3.]
+ [4. 5. 6.]
+ [7. 8. 9.]]
+[[11. 12. 13.]
+ [14. 15. 16.]
+ [17. 18. 19.]]
+[[21. 22. 23.]
+ [24. 25. 26.]
+ [27. 28. 29.]]
+```
+
+我们想将他反卷积为output_shape=[1, 7, 7, 2], strides=[1, 3, 3, 1], padding='SAME'
+
+**step1**：
+
+tensorflow会将它首先处理为一个resize_nearest_neighbor的扩展矩阵：
+
+```python
+[[1 0 0 2 0 0 3]
+ [0 0 0 0 0 0 0]
+ [0 0 0 0 0 0 0]
+ [4 0 0 5 0 0 6]
+ [0 0 0 0 0 0 0]
+ [0 0 0 0 0 0 0]
+ [7 0 0 8 0 0 9]]
+...ch2
+...ch3
+```
+
+假设kernel原始尺寸为：2, 2, 2, 3，这里意为将input的3通道处理为2通道最终输出
+
+```python
+[  [2*3], [2*3]
+   [2*3], [2*3]  ]
+[    A , B
+     C , D    ]
+```
+
+将kernel视作 ABCD四块 也即是2×2
+
+**step2**：
+
+同时为input补零（padding=same）strides是3意思是经过了步进3的正卷积得到input，所以要反卷积就要放大3倍，再根据kernel尺寸为2，优先给左侧和上侧扩展一列一行0，如下图：
+
+```python
+ 0 0 0 0 0 0 0 0 
+ 0[1 0 0 2 0 0 3]
+ 0[0 0 0 0 0 0 0]
+ 0[0 0 0 0 0 0 0]
+ 0[4 0 0 5 0 0 6]
+ 0[0 0 0 0 0 0 0]
+ 0[0 0 0 0 0 0 0]
+ 0[7 0 0 8 0 0 9]
+...ch2
+...ch3
+```
+
+**step3**：
+
+对于kernel进行旋转（上下翻转+左右翻转）
+
+这样第一次卷积，也就是结果的0，0点位置，就是
+
+```python
+0 0   (ch1)   D, C
+0[1   卷积     B, A
+```
+
+进行所有7×7次卷积，得到结果，
+
+关于多通道输入输出：
+
+其中input 扩展为8×8的矩阵，元素点为1×3的向量（所有通道 ch1 ch2 ch2）
+
+kernel 元素点(ABCD)为2×3的向量（这里要把它转置一下变成3×2）
+
+1×3   矩阵乘  3×2  =  1×2   即为输出张量，每个元素点
+
+也即是最终输出为7×7×2
+
+转置卷积前置层 转置翻转和插零见下文：
+
+## 7.7 Tflip 自定义ncnn层
+
+为实现转置卷积，需要将ncnn中的filter（4，4，96，5440）进行两次翻转并将轴序调整为（96，5440，4，4）
+
+代码如下：
+
+```c++
+int w = bottom_blob.w;
+// std::cout<<"blob w: "<<w<<" bolb h: "<<h<<std::endl;
+size_t elemsize = bottom_blob.elemsize;
+
+// return an 1-channel top blob
+top_blob.create(w, elemsize, opt.blob_allocator);
+if (top_blob.empty())
+    return -100;
+
+float* outptr = top_blob.channel(0);
+// const float* ptr = bottom_blob.channel(0);
+
+// step 1:  reshape  (2,3,0,1)
+int shape[4] = {4,4,96,5440};
+int shift[4] = {shape[1]*shape[2]*shape[3],shape[2]*shape[3],shape[3],1};
+int t[4]={2,3,0,1};
+
+ncnn::Mat temp = top_blob.clone();  // temp save the blob which is prepare to transpose
+outptr = top_blob.channel(0);       // re point to top_blob start position
+float* temptr = temp.channel(0);
+
+int index = 0;
+for(int i=0;i<shape[t[0]];i++){
+    for(int j=0;j<shape[t[1]];j++){
+        for(int m=0;m<shape[t[2]];m++){
+            for(int n=0;n<shape[t[3]];n++){
+                outptr[index++] = temptr[i*shift[t[0]] + j*shift[t[1]] + m*shift[t[2]] + n*shift[t[3]]];
+            }
+        }
+    }
+}
+
+//step 2: flip twice
+ncnn::Mat temp = top_blob.clone();
+float* temptr = temp.channel(0);
+for(int i=0;i<96;i++){
+    for(int j=0;j<5440;j++){
+        for(int m=0;m<4;m++){
+            for(int n=0;n<4;n++){
+                outptr[16*(j+i*5440) + n+m*4] = temptr[16*(j+i*5440) + (3-n)+(3-m)*4];
+            }
+        }
+    }
+}			
+
+
+```
+
+## 7.8 Interpz 自定义ncnn层
+
+
+
+## 7. Exc 自定义ncnn层
 
 输入： dim=3的ncnn::Mat    5440 5440 1
 
@@ -1100,16 +1242,91 @@ int Exc::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 
 
 
-### 7.8 Reducemean 自定义ncnn层
+## 7. Reducemean 自定义ncnn层
+
+实现类似tensorflow中的对于 【0，1，2】的reduce求均值，在本网络中tensorflow使用了3，3，1，5440的递归求和，所以实际上要针对5440中的一个点，进行3×3也就是number=9的计算，求出均值，并使用fabs(ssum/number)<1e-6观察均值是否为0，从而实现类似cast的功能，对应到1.0和0.0
+
+```c++
+int Reducemean::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+{
+    int number = 9;
+    int output = 5440;
+    size_t elemsize = bottom_blob.elemsize;
+    // square
+
+    top_blob.create(85,64,output, elemsize, opt.workspace_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    const float* ptr = bottom_blob.channel(0);  
+
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q=0; q<output; q++)
+    {
+        float* outptr = top_blob.channel(q);
+        float ssum = 0.f;
+        for (int i=0; i<number; i++)
+        {
+            ssum += ptr[i*output+q] * ptr[i*output+q];  // first: cal 3*3 <channel q mean>   save in ssum
+        }
+
+        if(fabs(ssum/number)<1e-6)
+            for(int i=0;i<64*85;i++)  //second: let every pixel(64*85) in channel q cast to 1.0 or 0.0
+                outptr[i] = 1.0f;
+        else
+            for(int i=0;i<64*85;i++)
+                outptr[i] = 0.0f;
+    }
+
+
+    std::cout<<" reduce mean cast "<<std::endl;
+
+    return 0;
+}
+```
 
 
 
+## 7. softmax 修改ncnn
+
+ncnn的softmax对于三维情况处理有问题，不能按通道并行来计算，需要针对每个像素点计算全部通道，所以改写如下
+
+```c++
+if (dims == 3 && axis == 2)
+{
+    int w = bottom_top_blob.w;
+    int h = bottom_top_blob.h;
+    int channels = bottom_top_blob.c;
+
+    float* ptr[channels];
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q=0; q<channels; q++){
+        ptr[q] = bottom_top_blob.channel(q);  // 初始化每个通道的指针 存入指针数组
+    }
 
 
+    for(int i=0;i<h;i++){
+        for(int j=0;j<w;j++){
 
+            float channel_max = -FLT_MAX;
+            for (int q=0; q<channels; q++){
+                channel_max = std::max(channel_max, ptr[q][j+i*w]);// 求单像素点全通道最大值
+            }
 
+            float sum = 0.f;
+            for (int q=0; q<channels; q++){
+                ptr[q][j+i*w] = exp(ptr[q][j+i*w]-channel_max); //减去最大值防止exp溢出  
+                sum += ptr[q][j+i*w];                           //求和  
+            }
 
+            for (int q=0; q<channels; q++){
+                ptr[q][j+i*w] /= sum;         //求单点 每个通道的概率                    
+            }
 
+        }
+    }
 
+```
 
 
