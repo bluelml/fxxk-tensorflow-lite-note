@@ -614,10 +614,10 @@ make install //安装flatc
 flat --version
 ```
 
-解析tflite文件到JSON格式：注意--后的空格
+解析tflite文件到JSON格式：注意文件名前--后的空格，注意strict json参数保证输出的json是带双引号的严格格式
 
 ```shell
-./flatc -t schema.fbs -- my.tflite
+./flatc -t schema.fbs -- my.tflite --strict-json
 ```
 
 该模型my.tflite将被解析为my.json
@@ -652,6 +652,10 @@ Model
       outputs                        //该节点输出张量编号
       ...                            //其他属性等
   buffers                            //参数仓库
+  metadata                           // tf 2.x 添加这个描述 对应2.x的tflite解释器 不修改会出错
+    name
+    min_runtime_version
+    buffer
 ```
 
 例如需要手动修改移除某节点，流程如下：
@@ -666,6 +670,8 @@ d. 在operator_codes等处做相应修改
 
 e. 使用flatc工具更新tflite模型
 
+参见tflite_to_csv脚本 直接运行流程
+
 ## 6.3 TfLite解释器加载与解析
 
 解释器加载tflite模型，放入内存只读区域，也有一些需要动态更新的buffer另开辟动态区域，解释器主要处理张量和节点两大内容
@@ -679,4 +685,111 @@ b. 对于node，首先解析operators为TfLiteNode
 ​	并为之对应的匹配存在于TfLiteRegistration中的算子的kernel指针
 
 至此完成了模型的加载
+
+调试tflite的解释器，需要从subgraph中的PrepareOpsStartingAt等函数中使用
+
+```c++
+fprintf(stderr,"subgraphe allocatetensor start: %d of %d\n",execution_plan_index,execution_plan_.size());
+```
+
+等语句进行控制台调试
+
+# 7 修补
+
+ResizeNearestNeighbor
+
+```c++
+template <typename T>
+inline void ResizeNearestNeighbor(
+    const tflite::ResizeNearestNeighborParams& op_params,
+    const RuntimeShape& unextended_input_shape, const T* input_data,
+    const RuntimeShape& output_size_shape, const int32* output_size_data,
+    const RuntimeShape& unextended_output_shape, T* output_data) {
+  // Align corners = true is not supported.
+  TFLITE_DCHECK(!op_params.align_corners);
+  TFLITE_DCHECK_LE(unextended_input_shape.DimensionsCount(), 4);
+  TFLITE_DCHECK_LE(unextended_output_shape.DimensionsCount(), 4);
+
+  const RuntimeShape input_shape =
+      RuntimeShape::ExtendedShape(4, unextended_input_shape);
+  const RuntimeShape output_shape =
+      RuntimeShape::ExtendedShape(4, unextended_output_shape);
+
+  int32 batches = MatchingDim(input_shape, 0, output_shape, 0);
+  int32 input_height = input_shape.Dims(1);
+  int32 input_width = input_shape.Dims(2);
+  int32 depth = MatchingDim(input_shape, 3, output_shape, 3);
+
+  // The Tensorflow version of this op allows resize on the width and height
+  // axis only.
+  TFLITE_DCHECK_EQ(output_size_shape.FlatSize(), 2);
+  int32 output_height = output_size_data[0];
+  int32 output_width = output_size_data[1];
+
+  // We use float to ensure agreement with the Tensorflow implementation.
+  const float height_scale = static_cast<float>(input_height-1) / (output_height-1);
+  const float width_scale = static_cast<float>(input_width-1) / (output_width-1);//增加align corner 功能
+
+  const int col_offset = input_shape.Dims(3);
+  const int row_offset = input_shape.Dims(2) * col_offset;
+  const int batch_offset = input_shape.Dims(1) * row_offset;
+
+  const T* input_ptr = input_data;
+  T* output_ptr = output_data;
+  for (int b = 0; b < batches; ++b) {
+    for (int y = 0; y < output_height; ++y) {
+      int32 in_y = std::min(static_cast<int32>((int)(y * height_scale +0.5)), //增加align corner 功能
+                            input_height - 1);
+      const T* y_input_ptr = input_ptr + in_y * row_offset;
+      for (int x = 0; x < output_width; ++x) {
+        int32 in_x = std::min(static_cast<int32>((int)(x * width_scale +0.5)),
+                              input_width - 1);
+        const T* x_input_ptr = y_input_ptr + in_x * col_offset;
+        memcpy(output_ptr, x_input_ptr, depth * sizeof(T));
+        output_ptr += depth;
+      }
+    }
+    input_ptr += batch_offset;
+  }
+}
+
+```
+
+
+
+extractimagepatch
+
+```c++
+#include <algorithm> 
+
+int pad_r_anchor = -1;
+int pad_c_anchor = -1; 
+for(int i=0; i<padding_row_num; i++){
+    for(int j=0; j<padding_col_num; j++){
+        int pad_r = pad_r_anchor + i*strides;
+        int pad_c = pad_c_anchor + j*strides;
+        int index = 0;
+        for(int m=0; m<sizes; m++){
+            for(int n=0; n<sizes; n++){
+                int pointer_r = pad_r + m;
+                int pointer_c = pad_c + n;
+                if(pointer_r >= h||pointer_c >= w||pointer_r<0||pointer_c<0){   
+                    for(int ic=0; ic<channels; ic++){
+                        std::fill(out,out+channels,0);  //填零
+                    } 
+                }else{
+                    for(int ic=0; ic<channels; ic++){
+                        memcpy(out, in+(pointer_r*w+pointer_c)*channels,  channels* sizeof(float)); // 内存copy 速度快一些 要用到#include <algorithm> 
+                    }
+                }
+                out+=channels;
+            }
+        }
+    }
+}
+```
+
+
+
+
 

@@ -709,7 +709,7 @@ shape:(1, 2, 2, 48)
 
 ## 7.3 Interp 中心对齐 修改ncnn
 
-中心对齐问题
+下采样中心对齐问题
 
 tf.image.resize_nearest_neighbor包含中心对齐（或者称为align_corners）的问题
 
@@ -1153,8 +1153,8 @@ for(int i=0;i<shape[t[0]];i++){
 }
 
 //step 2: flip twice
-ncnn::Mat temp = top_blob.clone();
-float* temptr = temp.channel(0);
+temp = top_blob.clone();
+temptr = temp.channel(0);
 for(int i=0;i<96;i++){
     for(int j=0;j<5440;j++){
         for(int m=0;m<4;m++){
@@ -1170,9 +1170,28 @@ for(int i=0;i<96;i++){
 
 ## 7.8 Interpz 自定义ncnn层
 
+对于一个矩阵：
+
+```python
+[[1. 2. 3.]
+ [4. 5. 6.]
+ [7. 8. 9.]]
+```
+
+该插值为了配合转置卷积，优先向左上方插0
+
+```python
+[[0 0 0 0 0 0]
+ [0 1 0 2 0 3]
+ [0 0 0 0 0 0]
+ [0 4 0 5 0 6]
+ [0 0 0 0 0 0]
+ [0 7 0 8 0 9]]
+```
 
 
-## 7. Exc 自定义ncnn层
+
+## 7.9 Exc 自定义ncnn层
 
 输入： dim=3的ncnn::Mat    5440 5440 1
 
@@ -1242,7 +1261,7 @@ int Exc::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 
 
 
-## 7. Reducemean 自定义ncnn层
+## 7.10 Reducemean 自定义ncnn层
 
 实现类似tensorflow中的对于 【0，1，2】的reduce求均值，在本网络中tensorflow使用了3，3，1，5440的递归求和，所以实际上要针对5440中的一个点，进行3×3也就是number=9的计算，求出均值，并使用fabs(ssum/number)<1e-6观察均值是否为0，从而实现类似cast的功能，对应到1.0和0.0
 
@@ -1288,7 +1307,7 @@ int Reducemean::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt
 
 
 
-## 7. softmax 修改ncnn
+## 7.11 softmax 修改ncnn
 
 ncnn的softmax对于三维情况处理有问题，不能按通道并行来计算，需要针对每个像素点计算全部通道，所以改写如下
 
