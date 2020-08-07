@@ -696,7 +696,13 @@ fprintf(stderr,"subgraphe allocatetensor start: %d of %d\n",execution_plan_index
 
 # 7 修补
 
-ResizeNearestNeighbor
+## ResizeNearestNeighbor 增加中心对齐（align corner）功能
+
+实际实现在kernels/internal/reference/reference_op.h中 line4364
+
+原本函数秀了神bug：  // Align corners = true is not supported.然后在check之后没有写align corner功能
+
+补充之
 
 ```c++
 template <typename T>
@@ -757,7 +763,7 @@ inline void ResizeNearestNeighbor(
 
 
 
-extractimagepatch
+## extractimagepatch 自定义
 
 ```c++
 #include <algorithm> 
@@ -789,7 +795,53 @@ for(int i=0; i<padding_row_num; i++){
 }
 ```
 
+## l2_norm（修改求均值的维度）
 
+实际实现在kernels/internal/optimized/optimized_op.h中 line1369
+
+原本函数求均值实在dim3上求得均值  而本模型要求在dim0 1 2上求均值
+
+```c++
+
+inline void L2Normalization(const tflite::L2NormalizationParams& op_params,  //你喵的参数params传进来用了么？！
+                            const RuntimeShape& input_shape,
+                            const float* input_data,
+                            const RuntimeShape& output_shape,
+                            float* output_data) {
+  gemmlowp::ScopedProfilingLabel label("L2Normalization_gx");
+  const int trailing_dim = input_shape.DimensionsCount() - 1;
+  const int outer_size =  //864 dim0*dim1*dim2
+      MatchingFlatSizeSkipDim(input_shape, trailing_dim, output_shape);
+  const int depth =  //5440 dim3
+      MatchingDim(input_shape, trailing_dim, output_shape, trailing_dim);
+  // fprintf(stderr,"\ntrailing_dim: %d, outer_size: %d, depth: %d\n",trailing_dim,outer_size,depth);
+  // for (int i = 0; i < outer_size; ++i) {   //for 864        //原有错误写法
+  //   float squared_l2_norm = 0;
+  //   for (int c = 0; c < depth; ++c) { // for5440
+  //     const float val = input_data[c];
+  //     squared_l2_norm += val * val;
+  //   }
+  //   const float l2_norm = std::sqrt(squared_l2_norm);
+  //   for (int c = 0; c < depth; ++c) {
+  //     *output_data = *input_data / l2_norm;
+  //     ++output_data;
+  //     ++input_data;
+  //   }
+  // }
+  for(int ch=0; ch<depth; ch++){    // for 5440 each channels
+    float squared_l2_norm = 0;
+    for(int p=0; p<outer_size; p++){  // for 864
+      const float val = input_data[p*depth+ch];
+      squared_l2_norm += val * val;
+    }
+    const float l2_norm = std::sqrt(squared_l2_norm);
+    for(int p=0; p<outer_size; p++){
+      output_data[p*depth+ch] = input_data[p*depth+ch] / l2_norm;
+    }
+  }
+}
+
+```
 
 
 
