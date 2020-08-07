@@ -843,5 +843,27 @@ inline void L2Normalization(const tflite::L2NormalizationParams& op_params,  //�
 
 ```
 
+## true_div自动转换问题
+
+在tf中使用
+
+```python
+yi = tf.nn.conv2d_transpose(yi, raw_w,[1,128,170,96], strides=[1,rate,rate,1]) / 4.
+```
+
+最后的除四在转换为tflite的过程中，将可能会自动转化除进下一级的conv2d的kernels之中，也就是最后tflite的结果并没有div这个op
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
