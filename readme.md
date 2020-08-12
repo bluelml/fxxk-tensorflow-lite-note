@@ -859,6 +859,427 @@ yi = tf.nn.conv2d_transpose(yi, raw_w,[1,128,170,96], strides=[1,rate,rate,1]) /
 
 
 
+# 8 量化压缩和推断总览
+
+函数调用关系总览
+
+```c++
+subgraph.cc        ../lite/core     子图 负责处理主要推断逻辑
+    先调用节点init和prepare函数准备张量
+    for node 遍历节点推断
+        conv op invoke节点调用eval函数
+        
+conv.cc            ../lite/kernels  算子库
+	prepare
+	eval
+		EvalFloat
+			optimized_ops::Conv
+		EvalHybrid
+			optimized_ops::HybridConv
+			
+optimized_ops.h    ../lite/kernels/internal/optimized  优化算子负责实现计算逻辑
+	Conv
+		if DilatedIm2col
+		else if Im2Col
+		else 
+		GEMM calculate //非压缩推断计算终点
+	HybridConv
+		if DilatedIm2col
+		else if Im2Col
+		else 
+		NEON calculate //混合压缩推断计算终点
+
+im2col_utlis.h     ../lite/kernels/internal/optimized  优化算子负责实现计算逻辑
+	DilatedIm2col
+	Im2Col
+```
+
+
+
+## 8.1 conv op
+
+tflite的量化压缩原理参见英伟达的经典ppt，和ncnn类似，主要的压缩模式被称为混合压缩（全8bit压缩等不推荐）
+
+也即是主要压缩卷积filter的参数
+
+主数据是float32模式，输入conv算子
+
+接着prepare中
+
+首先判断是否需要hybrid混合压缩
+
+
+```c++
+ const bool is_hybrid =
+      (input->type == kTfLiteFloat32 &&
+       (filter->type == kTfLiteUInt8 || filter->type == kTfLiteInt8));
+```
+
+第二使用AllocateTemporaryTensorsIfRequired 计算出data->need_im2col 即是否需要运行im2col优化
+
+在eval中判断卷积类型
+
+```c++
+  switch (input->type) {  // Already know in/outtypes are same.
+    case kTfLiteFloat32:
+      if (filter->type == kTfLiteUInt8 || filter->type == kTfLiteInt8) {
+        
+        EvalHybrid<kernel_type>(context, node, params, data, input, filter,        // 混合卷积 输入float32 参数int8
+                                bias, im2col, hwcn_weights, output);
+      } else {
+        EvalFloat<kernel_type>(context, node, params, data, input, filter, bias,   // 最正常的浮点卷积
+                               im2col, hwcn_weights, output);
+      }
+      break;
+    case kTfLiteUInt8:
+      EvalQuantized<kernel_type>(context, node, params, data, input, filter,       // 输入也是uint8的全整数卷积
+                                 bias, im2col, hwcn_weights, output);
+      break;
+    case kTfLiteInt8:
+      EvalQuantizedPerChannel<kernel_type>(context, node, params, data, input,     // 输入是int8的全整数卷积
+                                           filter, bias, output, im2col);
+      break;
+    default:
+      context->ReportError(context, "Type %d not currently supported.",
+                           input->type);
+      return kTfLiteError;
+  }
+```
+
+
+
+最正常的浮点卷积：
+
+调用了optimized_ops脚本中的conv，tflite把算子依据不同的使用场景分别写在不同的脚本之中
+
+```c++
+template <KernelType kernel_type>
+void EvalFloat(TfLiteContext* context, TfLiteNode* node,
+               TfLiteConvParams* params, OpData* data, TfLiteTensor* input,
+               TfLiteTensor* filter, TfLiteTensor* bias, TfLiteTensor* im2col,
+               TfLiteTensor* hwcn_weights, TfLiteTensor* output) {
+...
+  switch (effective_kernel_type) {
+    case kReference: {
+      reference_ops::Conv(op_params, GetTensorShape(input),
+                          GetTensorData<float>(input), GetTensorShape(filter),
+                          GetTensorData<float>(filter), GetTensorShape(bias),
+                          GetTensorData<float>(bias), GetTensorShape(output),
+                          GetTensorData<float>(output), GetTensorShape(im2col),
+                          GetTensorData<float>(im2col));
+      break;
+    }
+    case kCblasOptimized:
+    case kGenericOptimized: {  // 一般在这里 使用了通用优化的conv算子
+      optimized_ops::Conv(op_params, GetTensorShape(input),
+                          GetTensorData<float>(input), GetTensorShape(filter),
+                          GetTensorData<float>(filter), GetTensorShape(bias),
+                          GetTensorData<float>(bias), GetTensorShape(output),
+                          GetTensorData<float>(output), GetTensorShape(im2col),
+                          GetTensorData<float>(im2col),
+                          cpu_backend_support::GetFromContext(context));
+      break;
+    }
+    case kMultithreadOptimized: {
+#ifdef TFLITE_WITH_RUY
+      // See Register_CONV_2D: we should never be here when tflite_with_ruy
+      // was enabled. We #if out this code in order to get the corresponding
+      // binary size benefits.
+      TFLITE_DCHECK(false);
+#else
+      const float* filter_data;
+      if (data->need_hwcn_weights) {
+        filter_data = GetTensorData<float>(hwcn_weights);
+      } else {
+        filter_data = GetTensorData<float>(filter);
+      }
+      multithreaded_ops::Conv(  // 如果支持多线程 会调用multithreaded_ops中的卷积
+          *eigen_support::GetThreadPoolDevice(context), op_params,
+          GetTensorShape(input), GetTensorData<float>(input),
+          GetTensorShape(filter), filter_data, GetTensorShape(bias),
+          GetTensorData<float>(bias), GetTensorShape(output),
+          GetTensorData<float>(output), GetTensorShape(im2col),
+          GetTensorData<float>(im2col));
+      break;
+#endif
+    }
+  }
+}
+```
+
+压缩使用的混合卷积：
+
+```c++
+template <KernelType kernel_type>
+void EvalHybrid(TfLiteContext* context, TfLiteNode* node,
+                TfLiteConvParams* params, OpData* data, TfLiteTensor* input,
+                TfLiteTensor* filter, TfLiteTensor* bias, TfLiteTensor* im2col,
+                TfLiteTensor* hwcn_weights, TfLiteTensor* output) {
+                  
+...
+      optimized_ops::HybridConv(  // 调用了optimized_ops中的混合卷积函数
+          op_params, scaling_factors_ptr, GetTensorShape(input),
+          quantized_input_ptr_batch, GetTensorShape(filter), filter_ptr,
+          GetTensorShape(bias), GetTensorData<float>(bias),
+          GetTensorShape(output), GetTensorData<float>(output),
+          GetTensorShape(im2col), im2col_ptr);
+      break;
+    }
+  }
+}
+```
+
+## 8.2 optimized_ops
+
+在optimized_ops脚本中包含三个卷积conv
+
+```c++
+inline void Conv(const ConvParams& params, const RuntimeShape& input_shape,
+                 const uint8* input_data, const RuntimeShape& filter_shape,
+                 const uint8* filter_data, const RuntimeShape& bias_shape,
+                 const int32* bias_data, const RuntimeShape& output_shape,
+                 uint8* output_data, const RuntimeShape& im2col_shape,
+                 uint8* im2col_data, CpuBackendContext* cpu_backend_context)    // 全 int8卷积 input filter bias
+
+
+inline void Conv(const ConvParams& params, const RuntimeShape& input_shape,
+                 const float* input_data, const RuntimeShape& filter_shape,
+                 const float* filter_data, const RuntimeShape& bias_shape,
+                 const float* bias_data, const RuntimeShape& output_shape,
+                 float* output_data, const RuntimeShape& im2col_shape,
+                 float* im2col_data, CpuBackendContext* cpu_backend_context)     // 全 float卷积 input filter bias
+    
+inline void HybridConv(const ConvParams& params, float* scaling_factors_ptr,
+                       const RuntimeShape& input_shape,
+                       const int8_t* input_data,
+                       const RuntimeShape& filter_shape,
+                       const int8_t* filter_data,
+                       const RuntimeShape& bias_shape, const float* bias_data,
+                       const RuntimeShape& output_shape, float* output_data,
+                       const RuntimeShape& im2col_shape, int8_t* im2col_data)    // 混合卷积 int8-input int8-filter float-bias
+```
+
+其中im2col_data 是从conv op的eval函数就传进来的一个张量指针，一路传递到上述三个实际处理卷积逻辑的函数中，最终又传入im2col函数直接在内存上处理，并没有返回值
+
+```c++
+TfLiteTensor* im2col =
+      data->need_im2col
+          ? &context->tensors[node->temporaries->data[data->im2col_index]]
+          : nullptr;
+```
+
+对于全float卷积：
+
+```c++
+inline void Conv(...) {
+...
+  const bool need_dilated_im2col =
+      dilation_width_factor != 1 || dilation_height_factor != 1;                     // 判断是否需要处理空洞卷积
+  const bool need_im2col = stride_width != 1 || stride_height != 1 ||
+                           filter_width != 1 || filter_height != 1;                  // 判断是否需要处理im2col优化
+  if (need_dilated_im2col) {
+    DilatedIm2col(params, float_zero_byte, input_shape, input_data,
+                  filter_shape, output_shape, im2col_data);                          // 使用空洞卷积特别的im2col
+    gemm_input_data = im2col_data;
+    gemm_input_shape = &im2col_shape;
+  } else if (need_im2col) {
+    TFLITE_DCHECK(im2col_data);
+    Im2col(params, filter_height, filter_width, float_zero_byte, input_shape,
+           input_data, im2col_shape, im2col_data);                                   // 使用无空洞卷积（dilatedrate=1）的im2col
+    gemm_input_data = im2col_data;
+    gemm_input_shape = &im2col_shape;
+  } else {
+    // TODO(aselle): We need to make sure to not send im2col if it is not
+    // needed.
+    TFLITE_DCHECK(!im2col_data);
+    gemm_input_data = input_data;                                                    // 不需要im2col优化 直接给gemm_input_data
+    gemm_input_shape = &input_shape;
+  }
+...
+  cpu_backend_gemm::Gemm(lhs_params, filter_data, rhs_params, gemm_input_data,       // 使用第三方gemm库加速矩阵乘法 
+                         dst_params, output_data, gemm_params,
+                         cpu_backend_context);
+#endif  //  defined(TF_LITE_USE_CBLAS) && defined(__APPLE__)
+}
+```
+
+
+
+注意！！！对于混合卷积 tflite没有实现空洞卷积的判断，如果直接使用源代码会直接调用im2col引发崩溃
+
+添加空洞卷积逻辑之后的修正代码，并传入正确的int8零值
+
+```c++
+inline void HybridConv(const ConvParams& params, float* scaling_factors_ptr,
+                       const RuntimeShape& input_shape,
+                       const int8_t* input_data,
+                       const RuntimeShape& filter_shape,
+                       const int8_t* filter_data,
+                       const RuntimeShape& bias_shape, const float* bias_data,
+                       const RuntimeShape& output_shape, float* output_data,
+                       const RuntimeShape& im2col_shape, int8_t* im2col_data) {     
+  const int stride_width = params.stride_width;
+  const int stride_height = params.stride_height;
+  const float output_activation_min = params.float_activation_min;
+  const float output_activation_max = params.float_activation_max;
+  /////////////////////////////////  取出空洞卷积参数 并判断是否需要空洞卷积
+  const int32 input_offset = params.input_offset;//
+  const int dilation_width_factor = params.dilation_width_factor;
+  const int dilation_height_factor = params.dilation_height_factor;
+  const bool need_dilated_im2col =
+      dilation_width_factor != 1 || dilation_height_factor != 1;
+  ////////////////////////////////////
+  TFLITE_DCHECK_EQ(input_shape.DimensionsCount(), 4);
+  TFLITE_DCHECK_EQ(filter_shape.DimensionsCount(), 4);
+  TFLITE_DCHECK_EQ(output_shape.DimensionsCount(), 4);
+  const int batch_size = input_shape.Dims(0);
+  const int filter_width = filter_shape.Dims(2);
+  const int filter_height = filter_shape.Dims(1);
+
+  const int8_t* gemm_input_data = nullptr;
+  int num_input;
+  const bool need_im2col = stride_width != 1 || stride_height != 1 ||
+                           filter_width != 1 || filter_height != 1;
+  /////////////////////////////////////
+  if (need_dilated_im2col) {
+    TFLITE_DCHECK(im2col_data);
+    const int input_zero_point = 0x00; // 注意这里必须是0x00 也即是int8的零值 用于DilatedIm2col函数填充空位 否则会有意外错误
+    TFLITE_DCHECK_GE(input_zero_point, 0);
+    TFLITE_DCHECK_LE(input_zero_point, 255);
+    DilatedIm2col(params, input_zero_point, input_shape, input_data,
+                  filter_shape, output_shape, im2col_data);
+    gemm_input_data = im2col_data;
+    num_input = im2col_shape.FlatSize();
+  } //  添加空洞卷积逻辑 将DilatedIm2col处理结果传给gemm_input_data
+  else if (need_im2col) {
+    TFLITE_DCHECK(im2col_data);
+    // symmetric quantization assumes zero point of 0.
+    const int input_zero_point = 0;
+
+    Im2col(params, filter_height, filter_width, input_zero_point, input_shape,
+           input_data, im2col_shape, im2col_data);
+    gemm_input_data = im2col_data;
+    num_input = im2col_shape.FlatSize();
+  } else {
+    TFLITE_DCHECK(!im2col_data);
+    gemm_input_data = input_data;
+    num_input = input_shape.FlatSize();
+  }
+
+  // Flatten 4D matrices into 2D matrices for matrix multiplication.
+  // Flatten so that each filter has its own row.
+  const int filter_rows = filter_shape.Dims(0);
+  const int filter_cols = FlatSizeSkipDim(filter_shape, 0);
+
+  // In MatrixBatchVectorMultiplyAccumulate, each output value is the
+  // dot product of one row of the first matrix with one row of the second
+  // matrix. Therefore, the number of cols in each matrix are equivalent.
+  //
+  // After Im2Col, each input patch becomes a row.
+  const int gemm_input_cols = filter_cols;
+  const int gemm_input_rows = num_input / gemm_input_cols;
+  const int output_cols = output_shape.Dims(3);
+  const int output_rows = FlatSizeSkipDim(output_shape, 3);
+  TFLITE_DCHECK_EQ(output_cols, filter_rows);
+  TFLITE_DCHECK_EQ(output_rows, gemm_input_rows);
+  TFLITE_DCHECK_EQ(bias_shape.FlatSize(), output_cols);
+
+  // MatrixBatchVectorMultiplyAccumulate assumes that each row of the second
+  // input matrix has its own scale factor. This code duplicates the scale
+  // factors for each row in the same batch.
+  const int rows_per_batch = gemm_input_rows / batch_size;
+  for (int i = gemm_input_rows - 1; i >= 0; --i) {
+    scaling_factors_ptr[i] = scaling_factors_ptr[i / rows_per_batch];
+  }
+  tensor_utils::ZeroVector(output_data, output_rows * output_cols);
+  tensor_utils::MatrixBatchVectorMultiplyAccumulate(    // 注意这里不是使用gemm来实现矩阵运算 而是使用neon逻辑 在tensor_utils脚本中
+      filter_data, filter_rows, filter_cols, gemm_input_data,
+      scaling_factors_ptr, /*n_batch=*/gemm_input_rows, output_data,
+      /*result_stride=*/1);
+  AddBiasAndEvalActivationFunction(output_activation_min, output_activation_max,
+                                   bias_shape, bias_data, output_shape,
+                                   output_data);        // 额外处理bias和激活函数
+}
+```
+
+
+
+## 8.3 im2col_utlis.h
+
+这个脚本处理im2col优化的实际逻辑 在optimized_ops命名空间下
+
+主要包含三个函数：
+
+```c++
+inline void ExtractPatchIntoBufferColumn(const RuntimeShape& input_shape, int w,
+                                         int h, int b, int kheight, int kwidth,
+                                         int stride_width, int stride_height,
+                                         int pad_width, int pad_height,
+                                         int in_width, int in_height,
+                                         int in_depth, int single_buffer_length,
+                                         int buffer_id, const T* in_data,
+                                         T* conv_buffer_data, uint8 zero_byte)
+void DilatedIm2col(const ConvParams& params, uint8 zero_byte,
+                   const RuntimeShape& input_shape, const T* input_data,
+                   const RuntimeShape& filter_shape,
+                   const RuntimeShape& output_shape, T* im2col_data)  // 自己实现全部逻辑 不使用ExtractPatchIntoBufferColumn
+void Im2col(const ConvParams& params, int kheight, int kwidth, uint8 zero_byte,
+            const RuntimeShape& input_shape, const T* input_data,
+            const RuntimeShape& output_shape, T* output_data)         // 调用ExtractPatchIntoBufferColumn 处理每个col
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
