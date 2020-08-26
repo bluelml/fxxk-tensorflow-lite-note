@@ -134,6 +134,24 @@ rm -rf /usr/bin/bazel
 
 一般只是切换不需要更改.zshrc文件 先卸载再安装后 用bazel version验证版本
 
+bazel可以用来查看某个目标的所有依赖关系例如：
+
+```shell
+bazel query 'deps(//tensorflow/lite/java:tensorflowlite)' --output package      # 查看所有包（包指的是某个有BUILD文件的目录）
+bazel query 'deps(//tensorflow/lite/java:tensorflowlite)' --output graph        # 查看依赖图
+```
+
+注意：需要先进行各类配置再进行query，例如对于android ndk路径的指定，如果在configure之后制定了build option的ndk路径，在query时仍旧会出错，这是因为query并不是build，这时需要在tensorflow根目录的WORKSPACE文件之中显式指出ndk目录：
+
+```python
+android_ndk_repository(
+    name = "androidndk",
+    path = "/home/gx/android-ndk-r18b",
+)
+```
+
+对于sdk等问题同样，如果无法query但是能正常build，就需要在工作空间显式写明路径
+
 ## 4.2 TensorFlow源码的编译配置configure
 
 ### 4.2.1 ./configure先自动配置生成配置文件
@@ -194,6 +212,8 @@ g++ -std=c++11 -shared zerof.cc -o zerof.so -fPIC ${TF_CFLAGS[@]} ${TF_LFLAGS[@]
 ```python
 tf.load_op_library('??/zerof.so').zerof()  #调用so中的op
 ```
+
+如果模型中存在tensorflow都没有的算子，有两个办法处理，一是类似这种方式先给tf增加算子，然后在tflite中实现；二是可以直接更改tflite模型的flatbuffer文件（从json中改比较人性化）然后直接tflite中实现即可
 
 ### 4.3.3 单独构建python tensorflow lite解释器的.so共享库
 
@@ -694,9 +714,9 @@ fprintf(stderr,"subgraphe allocatetensor start: %d of %d\n",execution_plan_index
 
 等语句进行控制台调试
 
-# 7 修补
+# 7 kernels修补
 
-## ResizeNearestNeighbor 增加中心对齐（align corner）功能
+## 7.1 ResizeNearestNeighbor 增加中心对齐（align corner）功能
 
 实际实现在kernels/internal/reference/reference_op.h中 line4364
 
@@ -763,7 +783,7 @@ inline void ResizeNearestNeighbor(
 
 
 
-## extractimagepatch 自定义
+## 7.2 extractimagepatch 自定义
 
 ```c++
 #include <algorithm> 
@@ -795,7 +815,7 @@ for(int i=0; i<padding_row_num; i++){
 }
 ```
 
-## l2_norm（修改求均值的维度）
+## 7.3 l2_norm（修改求均值的维度）
 
 实际实现在kernels/internal/optimized/optimized_op.h中 line1369
 
@@ -843,7 +863,7 @@ inline void L2Normalization(const tflite::L2NormalizationParams& op_params,  //�
 
 ```
 
-## true_div自动转换问题
+## 7.4 true_div自动转换问题
 
 在tf中使用
 
@@ -1232,11 +1252,256 @@ void Im2col(const ConvParams& params, int kheight, int kwidth, uint8 zero_byte,
 
 
 
+# 9 tflite的c++构建和嵌入式部署
+
+## 9.1 构建路径总览
+
+原tensorflow的bazel构建文件里面提供了几处关于tflite解释器的构建target：
+
+共享库 libtensorflowlite.so 主要由 framework 和 builtin_ops 两个target组成
+
+```shell
+A. lite根目录下的c++共享库
+bazel build //tensorflow/lite:libtensorflowlite.so
+            依赖：//tensorflow/lite:framework               <--
+                 //tensorflow/lite/kernels:builtin_ops     <--
+                 
+B. lite示例代码中直接将源代码和共享库所需的framework以及builtin_ops一起构建为可执行文件
+bazel build //tensorflow/lite/examples/minimal:minimal
+            源文件：minimal.cc
+            依赖：//tensorflow/lite:framework               <--
+                 //tensorflow/lite/kernels:builtin_ops     <--
+                 
+C. python解释器封装
+bazel build //tensorflow/lite/python/interpreter_wrapper:tensorflow_wrap_interpreter_wrapper
+            依赖：//tensorflow/lite/python/interpreter_wrapper:interpreter_wrapper_lib
+                  依赖：//tensorflow/lite:framework             <--
+                       //tensorflow/lite/kernels:builtin_ops   <--
+                       ...
+                ...
+ 
+ D. 安卓aar打包
+ bazel build //tensorflow/lite/java:tensorflow-lite
+            依赖：//tensorflow/lite/java:tensorflowlite
+                  依赖：//tensorflow/lite/java:tensorflowlite_native
+                       源文件：//tensorflow/lite/java:libtensorflowlite_jni.so
+                             依赖：//tensorflow/lite/delegates/nnapi/java/src/main/native
+                                  //tensorflow/lite/java/src/main/native
+                                       :native
+                                            源文件：builtin_ops_jni.cc
+                                            依赖：//tensorflow/lite/kernels:builtin_ops   <--
+                                                 :native_framework_only
+                                                      源文件：...
+                                                      依赖：//tensorflow/lite:framework   <--
+```
+
+
+
+## 9.2 cmake构建共享库和业务逻辑代码
+
+为了给嵌入式平台使用tflite解释器和模型，以安卓为例，可以使用两类方法：
+
+A. 直接将解释器封装为aar包，参见4.3.4内容，由安卓studio导入并使用（官方发布的标准tflite可以自动下载，然而自己添加op修改过的tflite未尝试成功）
+
+B. 将tflite解释器封装为so文件，并在pc平台由传统cmake构建为二进制文件（目的是验证业务逻辑代码和模型执行有效性）。注意这里也可以采用bazel来进行构建打包验证，考虑到构建方式通用性，还是推荐选用cmake的方式来构建
+
+### 9.2.1 cmake工程文件结构
+
+```
+├── build                    // im1_14_myatt.tflite 等模型文件和输入输出图片放在这里
+├── include
+|     ├──flatbuffers         // flatbuffers的include文件
+|     └──tensorflow          // lite的include文件
+├── lib                      // libtrensorflowlite.so 等共享库
+├── src                      // 业务逻辑代码
+└── CmakeLists.txt
+```
+
+flatbuffers可以参见6.1 下载git 仓库并取出 include文件夹
+
+lite的include文件可以通过以下shell命令取出并解压到上述文件夹
+
+```shell
+cd tensorflow/tensorflow
+find ./lite -name "*.h" | tar -cf headers.tar -T -
+```
+
+libtrensorflowlite.so通过 9.1的A路径构建：
+
+```shell
+bazel build //tensorflow/lite:libtensorflowlite.so --fat_apk_cpu=x86_64,arm64-v8a,armeabi-v7a --cxxopt="-std=c++11"
+```
+
+cmake文件为：
+
+```cmake
+cmake_minimum_required(VERSION 3.15)
+project(my_tflite)
+set(CMAKE_CXX_STANDARD 14)
+# 添加opencv
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+# 添加头文件 lite和flatbuffers相关
+set(INC_DIR ./include)
+include_directories(${INC_DIR})
+# 添加共享库 tflite解释器
+set(LINK_DIR ./lib)
+link_directories(${LINK_DIR})
+link_libraries(tensorflowlite )
+
+add_executable(my_tflite ./src/minimal.cc)
+target_link_libraries(my_tflite tensorflowlite  ${OpenCV_LIBS})
+```
+
+示例业务逻辑代码为：
+
+```c++
+#include <cstdio>
+#include <ctime>
+#include "tensorflow/lite/interpreter.h"
+#include "tensorflow/lite/kernels/register.h"
+#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/optional_debug_tools.h"
+#include <opencv2/opencv.hpp>
+
+using namespace tflite;
+using namespace cv;
+using namespace std;
+
+int main(int argc, char** argv)
+{
+// std::string model_file = "./im1_14_myatt.tflite";
+std::string model_file = "./im2_myatt.tflite";
+std::string image_file = "./input.png";
+
+cv::Mat image = cv::imread(image_file.c_str());
+image.convertTo(image, CV_32FC3); // cpp read to float32 and 3 channels
+
+std::unique_ptr<tflite::FlatBufferModel> model = tflite::FlatBufferModel::BuildFromFile(model_file.c_str());
+tflite::ops::builtin::BuiltinOpResolver resolver;
+std::unique_ptr<tflite::Interpreter> interpreter;
+
+tflite::InterpreterBuilder(*model, resolver)(&interpreter);
+
+TfLiteTensor* input_tensor     = nullptr;
+TfLiteTensor* output_image     = nullptr;
+
+interpreter->AllocateTensors();
+
+input_tensor = interpreter->tensor(interpreter->inputs()[0]);
+interpreter->SetNumThreads(1);
+
+// save opencv mat data into tflitetensor data.f
+float* dst = input_tensor->data.f;
+const int row_elems = image.cols * image.channels();
+for (int row = 0; row < image.rows; row++) {
+    const float* row_ptr = image.ptr<float>(row);  // use float, not uchar
+    for (int i = 0; i < row_elems; i++) {
+        dst[i] = row_ptr[i];
+    }
+    dst += row_elems;
+}
+// run inference
+clock_t start = clock();
+interpreter->Invoke();
+clock_t end = clock();
+cout << " invoke time:" << (double)(end - start) / CLOCKS_PER_SEC << "s" << endl;
+
+// get output 
+output_image = interpreter->tensor(interpreter->outputs()[0]);
+// output_image = input_tensor;
+cv::Mat OUT(output_image->dims->data[1],output_image->dims->data[2],CV_32FC3,output_image->data.f);
+// swap channel012 to 210(this model need)
+for (int i = 0; i < OUT.rows; ++i) {
+    for (int j = 0; j < OUT.cols; ++j) {
+        Vec3f& pix = OUT.at<Vec3f>(i, j);
+        std::swap(pix[0], pix[2]);
+    }
+}
+cv::imwrite("./output_iamge.png", OUT);
+return 0;
+}
+```
+
+构建和运行：
+
+```shell
+cd ./build
+cmake ..
+make
+./my_tflite
+```
 
 
 
 
 
+### 9.2.2 bazel处理
+
+如果非要使用bazel，则构建方式和可能遇到的问题如下：
+
+构建时为了验证业务逻辑需要对opencv进行导入，方法如下：
+
+目录结构
+
+```
+├── WORKSPACE
+├── opencv.BUILD
+├── main.cc
+└── BUILD
+```
+
+WORKSPACE
+
+```python
+workspace(name = "bazel_test")
+new_local_repository(
+    name = "opencv",
+    path = "/home/xxx/xxx/opencv/install",
+    build_file = "opencv.BUILD",
+)
+```
+
+opencv.BUILD
+
+```python
+cc_library(
+    name = "opencv",
+    srcs = glob(["lib/*.so*"]),
+    hdrs = glob(["include/**/*.hpp"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"], 
+    linkstatic = 1,
+)
+```
+
+BUILD
+
+```python
+cc_binary(
+    name = "bazel_test",
+    srcs = ["main.cc"],
+    deps = [
+        "@opencv//:opencv",
+        "//tensorflow/lite:framework",
+        "//tensorflow/lite/kernels:builtin_ops",  
+        # 注意：这里没有显式地写明依赖flatbuffers 是因为builtin_ops -> builtin_op_kernels -> @flatbuffers之中已经引用了 
+    ],
+)
+```
+
+ main.cc
+
+```c++
+#include <opencv2/opencv.hpp>
+int main(int argc, char *argv[]) {
+    cv::Mat img = cv::imread("/home/alan/1.jpg");
+    std::cout << "Resolution: " << img.rows << " x " << img.cols << std::endl;
+    return 0;
+}
+```
+
+bazel最终构建方式为：bazel build //xxx/xxx:bazel_test
 
 
 
