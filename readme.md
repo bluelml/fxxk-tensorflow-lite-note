@@ -321,7 +321,7 @@ AddCustom("Zerof", tflite::ops::custom::Register_ZEROF());
 
 （注意：tf2.x以上在...site-packages/tensorflow_core/...    tf1.x则是在...site-packages/tensorflow/..）
 
-为解释器so文件建立软连接
+在该路径下为解释器so文件建立软连接
 
 ```shell
 ln -s /home/gx/myproj/tensorflow/bazel-bin/tensorflow/lite/python/interpreter_wrapper/_tensorflow_wrap_interpreter_wrapper.so _tensorflow_wrap_interpreter_wrapper.so
@@ -1328,8 +1328,21 @@ find ./lite -name "*.h" | tar -cf headers.tar -T -
 
 libtrensorflowlite.so通过 9.1的A路径构建：
 
+一定要注意本地pc的sse优化开关需要打开 -copt=-march=native默认打开当前cpu支持的所有优化（或者一个一个指定优化指令集-c opt --copt=-mavx --copt=-msse4.2 ），否则在计算gemm时将会有将近一倍的时间损失
+
+而且在4.3.3的python封装库中，该开关已经默认打开
+
 ```shell
-bazel build //tensorflow/lite:libtensorflowlite.so --fat_apk_cpu=x86_64,arm64-v8a,armeabi-v7a --cxxopt="-std=c++11"
+推荐
+bazel build //tensorflow/lite:libtensorflowlite.so --copt=-march=native --fat_apk_cpu=x86_64,arm64-v8a,armeabi-v7a --cxxopt="-std=c++11"
+或者
+bazel build //tensorflow/lite:libtensorflowlite.so -c opt --copt=-mavx --copt=-msse4.2 --fat_apk_cpu=x86_64,arm64-v8a,armeabi-v7a --cxxopt="-std=c++11"
+```
+
+类似4.3.3e，在lib路径下创建软连接，这样可以保证每次bazel构建之后不用手动更新lib文件夹下的so文件：
+
+```shell
+ln -s /home/gx/myproj/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.so libtensorflowlite.so
 ```
 
 cmake文件为：
